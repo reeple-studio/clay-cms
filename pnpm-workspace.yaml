@@ -1,0 +1,4 @@
+packages:
+  - packages/*
+  - playground
+approveBuilds: esbuild,workerd

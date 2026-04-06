@@ -1,0 +1,95 @@
+---
+import { actions } from "astro:actions";
+import config from "virtual:clay-cms/config";
+import type { ResolvedCollectionConfig } from "clay-cms";
+import BaseLayout from "./layouts/BaseLayout.astro";
+
+const { collections } = config;
+const user = Astro.locals.clayUser;
+
+const result = Astro.getActionResult(actions.cms.logout);
+if (result && !result.error) {
+	return Astro.redirect("/admin/login");
+}
+
+const allCollections = collections as ResolvedCollectionConfig[];
+
+// ? hide collections the current user has no read access to (Payload/Kide-style)
+const visibleCollections: ResolvedCollectionConfig[] = [];
+for (const collection of allCollections) {
+	const canRead = await collection.access.read({
+		user: user ?? null,
+		operation: "read",
+		collection: collection.slug,
+	});
+	if (canRead) visibleCollections.push(collection);
+}
+---
+
+<BaseLayout>
+	<div class="min-h-screen bg-neutral-950">
+		<header
+			class="border-b border-neutral-800 px-6 py-4 flex items-center justify-between"
+		>
+			<h1 class="text-lg font-semibold text-white">Clay CMS</h1>
+
+			<div class="flex items-center gap-4">
+				<span class="text-sm text-neutral-400">
+					{user?.name ?? user?.email}
+				</span>
+
+				<form method="POST" action={actions.cms.logout}>
+					<button
+						type="submit"
+						class="text-sm text-neutral-400 hover:text-white transition-colors"
+					>
+						Sign out
+					</button>
+				</form>
+			</div>
+		</header>
+
+		<main class="p-6">
+			<h2 class="text-sm font-medium text-neutral-400 uppercase tracking-wider mb-4">
+				Collections
+			</h2>
+
+			<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+				{
+					visibleCollections.map((collection) => {
+						const label =
+							collection.labels?.plural ??
+							collection.slug.charAt(0).toUpperCase() +
+								collection.slug.slice(1);
+						return (
+							<a
+								href={`/admin/collections/${collection.slug}`}
+								class="block p-4 border border-neutral-800 rounded-lg hover:border-neutral-600 transition-colors"
+							>
+								<div class="flex items-center justify-between">
+									<span class="text-white font-medium">
+										{label}
+									</span>
+									{collection.upload && (
+										<span class="text-xs text-neutral-500 border border-neutral-700 rounded px-1.5 py-0.5">
+											Upload
+										</span>
+									)}
+									{collection.auth && (
+										<span class="text-xs text-neutral-500 border border-neutral-700 rounded px-1.5 py-0.5">
+											System
+										</span>
+									)}
+								</div>
+								<p class="text-sm text-neutral-500 mt-1">
+									{Object.keys(collection.fields).length}{" "}
+									fields
+								</p>
+							</a>
+						);
+					})
+				}
+			</div>
+		</main>
+	</div>
+</BaseLayout>

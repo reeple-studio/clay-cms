@@ -1,0 +1,14 @@
+{
+	"compilerOptions": {
+		"strict": true,
+		"module": "Node16",
+		"moduleResolution": "Node16",
+		"target": "ES2022",
+		"declaration": true,
+		"esModuleInterop": true,
+		"skipLibCheck": true,
+		"ignoreDeprecations": "6.0",
+		"types": ["@cloudflare/workers-types"]
+	},
+	"exclude": ["dist"]
+}

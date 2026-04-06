@@ -1,0 +1,17 @@
+{
+	"name": "clay-cms-playground",
+	"compatibility_flags": ["nodejs_compat"],
+	"d1_databases": [
+		{
+			"binding": "CLAY_DB",
+			"database_name": "clay-cms-dev",
+			"database_id": "local"
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "CLAY_BUCKET",
+			"bucket_name": "clay-cms-assets"
+		}
+	]
+}

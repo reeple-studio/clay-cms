@@ -1,0 +1,150 @@
+---
+import cms from "virtual:clay-cms/api";
+import config from "virtual:clay-cms/config";
+import type { ResolvedCollectionConfig } from "clay-cms";
+import { AccessDeniedError } from "clay-cms/access";
+import BaseLayout from "../layouts/BaseLayout.astro";
+
+const { collections } = config;
+const { slug } = Astro.params;
+
+const collection = (collections as ResolvedCollectionConfig[]).find(
+	(c) => c.slug === slug,
+);
+
+if (!collection) {
+	return new Response(null, { status: 404, statusText: "Not Found" });
+}
+
+const user = Astro.locals.clayUser;
+
+const label =
+	collection.labels?.plural ??
+	collection.slug.charAt(0).toUpperCase() + collection.slug.slice(1);
+
+// ? determine which fields to show as columns (exclude system fields, upload internals, and auth internals)
+const systemFieldKeys = new Set([
+	"id",
+	"createdAt",
+	"updatedAt",
+	"filename",
+	"mimeType",
+	"filesize",
+	"url",
+	"width",
+	"height",
+	"hashedPassword",
+]);
+
+const columnEntries = Object.entries(collection.fields).filter(
+	([key]) => !systemFieldKeys.has(key),
+);
+
+// ? for upload collections, prepend filename as the first visible column
+const displayColumns: [string, (typeof collection.fields)[string]][] =
+	collection.upload
+		? [["filename", collection.fields.filename!], ...columnEntries]
+		: columnEntries;
+
+// ? fetch documents via the raw cms — pass the current session user so the gate enforces against them
+let documents: Record<string, unknown>[] = [];
+try {
+	documents = (await cms[slug!]!.find({ user })) as Record<string, unknown>[];
+} catch (err) {
+	if (err instanceof AccessDeniedError) {
+		return new Response(null, { status: 403, statusText: "Forbidden" });
+	}
+	throw err;
+}
+---
+
+<BaseLayout title={`${label} — Clay CMS`}>
+	<div class="min-h-screen bg-neutral-950">
+		<header
+			class="border-b border-neutral-800 px-6 py-4 flex items-center justify-between"
+		>
+			<div class="flex items-center gap-3">
+				<a
+					href="/admin"
+					class="text-neutral-400 hover:text-white transition-colors"
+				>
+					Clay CMS
+				</a>
+				<span class="text-neutral-600">/</span>
+				<h1 class="text-lg font-semibold text-white">{label}</h1>
+			</div>
+
+			<div class="flex items-center gap-4">
+				<span class="text-sm text-neutral-400">
+					{user?.name ?? user?.email}
+				</span>
+			</div>
+		</header>
+
+		<main class="p-6">
+			<div class="flex items-center justify-between mb-6">
+				<p class="text-sm text-neutral-400">
+					All {label.toLowerCase()}
+				</p>
+			</div>
+
+			{
+				displayColumns.length > 0 ? (
+					<div class="border border-neutral-800 rounded-lg overflow-hidden">
+						<table class="w-full text-sm">
+							<thead>
+								<tr class="border-b border-neutral-800 bg-neutral-900/50">
+									{displayColumns.map(([key]) => (
+										<th class="text-left px-4 py-3 text-neutral-400 font-medium">
+											{key}
+										</th>
+									))}
+									<th class="text-left px-4 py-3 text-neutral-400 font-medium">
+										Created
+									</th>
+								</tr>
+							</thead>
+
+							<tbody>
+								{documents.length > 0 ? (
+									documents.map((doc) => (
+										<tr
+											class="border-b border-neutral-800 hover:bg-neutral-900/30 transition-colors cursor-pointer"
+											onclick={`window.location='/admin/collections/${slug}/${doc.id}'`}
+										>
+											{displayColumns.map(([key]) => (
+												<td class="px-4 py-3 text-neutral-300">
+													{String(doc[key] ?? "—")}
+												</td>
+											))}
+											<td class="px-4 py-3 text-neutral-500">
+												{doc.createdAt
+													? new Date(
+															doc.createdAt as string,
+														).toLocaleDateString()
+													: "—"}
+											</td>
+										</tr>
+									))
+								) : (
+									<tr>
+										<td
+											colspan={displayColumns.length + 1}
+											class="px-4 py-8 text-center text-neutral-500"
+										>
+											No documents yet.
+										</td>
+									</tr>
+								)}
+							</tbody>
+						</table>
+					</div>
+				) : (
+					<p class="text-neutral-500">
+						This collection has no user-defined fields.
+					</p>
+				)
+			}
+		</main>
+	</div>
+</BaseLayout>

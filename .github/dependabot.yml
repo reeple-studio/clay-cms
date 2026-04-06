@@ -1,0 +1,27 @@
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directories:
+      - "/"
+      - "/packages/clay-cms"
+      - "/packages/drizzle"
+      - "/packages/db-d1"
+      - "/packages/storage-r2"
+      - "/playground"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    groups:
+      all-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    groups:
+      all-actions:
+        patterns:
+          - "*"

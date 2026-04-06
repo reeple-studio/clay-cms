@@ -1,0 +1,83 @@
+{
+	"name": "clay-cms",
+	"version": "0.0.0",
+	"description": "The missing CMS interface for your Astro project",
+	"type": "module",
+	"sideEffects": false,
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		},
+		"./config": {
+			"types": "./dist/index.d.ts",
+			"default": "./dist/config.js"
+		},
+		"./actions": "./src/actions.ts",
+		"./api": "./src/runtime/api.ts",
+		"./auth": "./src/auth/index.ts",
+		"./access": "./src/access/index.ts",
+		"./runtime/session-middleware.ts": "./src/runtime/session-middleware.ts",
+		"./admin/index.astro": "./src/admin/index.astro",
+		"./admin/setup.astro": "./src/admin/setup.astro",
+		"./admin/login.astro": "./src/admin/login.astro",
+		"./admin/collections/[slug].astro": "./src/admin/collections/[slug].astro",
+		"./admin/collections/[slug]/[id].astro": "./src/admin/collections/[slug]/[id].astro",
+		"./admin/middleware.ts": "./src/admin/middleware.ts"
+	},
+	"files": [
+		"dist",
+		"src/access",
+		"src/admin",
+		"src/auth",
+		"src/runtime"
+	],
+	"scripts": {
+		"dev": "tsup --watch",
+		"build": "tsup",
+		"prepublishOnly": "pnpm build"
+	},
+	"keywords": [
+		"astro-integration",
+		"astro-component",
+		"withastro",
+		"astro",
+		"astro-loader",
+		"utility",
+		"tooling",
+		"cms"
+	],
+	"author": {
+		"email": "miguel@reeple.studio",
+		"name": "REEPLE Studio",
+		"url": "https://www.reeple.studio"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git@github.com:reeple-studio/clay-cms.git"
+	},
+	"bugs": {
+		"url": "https://github.com/reeple-studio/clay-cms/issues",
+		"email": "miguel@reeple.studio"
+	},
+	"homepage": "https://clay-cms.reeple.studio",
+	"license": "MIT",
+	"peerDependencies": {
+		"astro": "^6.0.0"
+	},
+	"dependencies": {
+		"@clay-cms/drizzle": "workspace:*",
+		"@tailwindcss/vite": "^4.1.16",
+		"astro-integration-kit": "0.20.0",
+		"bcryptjs": "^3.0.3",
+		"drizzle-orm": "^0.45.2",
+		"jiti": "^2.4.2",
+		"tailwindcss": "^4.1.16"
+	},
+	"devDependencies": {
+		"@types/better-sqlite3": "^7.6.13",
+		"better-sqlite3": "^12.8.0",
+		"tsup": "8.5.1",
+		"typescript": "6.0.2"
+	}
+}
