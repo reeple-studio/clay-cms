@@ -1,0 +1,55 @@
+{
+	"name": "@clay-cms/adapter-tests",
+	"version": "0.0.0",
+	"description": "Shared conformance test suite for Clay CMS database & storage adapters",
+	"type": "module",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/reeple-studio/clay-cms.git",
+		"directory": "packages/adapter-tests"
+	},
+	"homepage": "https://clay-cms.reeple.studio",
+	"bugs": "https://github.com/reeple-studio/clay-cms/issues",
+	"sideEffects": false,
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		}
+	},
+	"files": [
+		"dist"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"scripts": {
+		"dev": "tsup --watch",
+		"build": "tsup",
+		"prepublishOnly": "pnpm build"
+	},
+	"keywords": [
+		"clay-cms",
+		"adapter",
+		"conformance",
+		"testing"
+	],
+	"license": "MIT",
+	"peerDependencies": {
+		"clay-cms": "workspace:*",
+		"vitest": "*"
+	},
+	"dependencies": {
+		"@clay-cms/drizzle": "workspace:*",
+		"drizzle-orm": "^0.45.2"
+	},
+	"devDependencies": {
+		"@clay-cms/db-libsql": "workspace:*",
+		"@libsql/client": "^0.17.4",
+		"@types/better-sqlite3": "^7.6.13",
+		"better-sqlite3": "^12.11.1",
+		"tsup": "8.5.1",
+		"typescript": "6.0.3",
+		"vitest": "^4.1.9"
+	}
+}

@@ -1,0 +1,47 @@
+{
+	"name": "@clay-cms/storage-r2",
+	"version": "0.0.0",
+	"description": "Cloudflare R2 storage adapter for Clay CMS",
+	"type": "module",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/reeple-studio/clay-cms.git",
+		"directory": "packages/storage-r2"
+	},
+	"homepage": "https://clay-cms.reeple.studio",
+	"bugs": "https://github.com/reeple-studio/clay-cms/issues",
+	"sideEffects": false,
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		}
+	},
+	"files": [
+		"dist"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"scripts": {
+		"dev": "tsup --watch",
+		"build": "tsup",
+		"prepublishOnly": "pnpm build"
+	},
+	"keywords": [
+		"astro",
+		"clay-cms",
+		"r2",
+		"cloudflare",
+		"storage"
+	],
+	"license": "MIT",
+	"peerDependencies": {
+		"clay-cms": "workspace:*"
+	},
+	"devDependencies": {
+		"@cloudflare/workers-types": "^4.20260701.1",
+		"tsup": "8.5.1",
+		"typescript": "6.0.3"
+	}
+}

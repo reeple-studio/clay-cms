@@ -1,0 +1,100 @@
+---
+import type { FieldConfig } from "clay-cms";
+
+export interface Props {
+	name: string;
+	field: FieldConfig;
+	value: unknown;
+	error?: string;
+	disabled?: boolean;
+}
+
+const { name, field, value, error, disabled = false } = Astro.props;
+
+const inputClasses =
+	"px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-white text-sm focus:outline-none focus:border-neutral-500 w-full";
+---
+
+<div class="flex flex-col gap-1">
+	<label for={name} class="text-sm text-neutral-300">{name}</label>
+
+	{
+		field.type === "text" && (
+			<input
+				type="text"
+				id={name}
+				name={name}
+				value={(value as string) ?? ""}
+				required={field.required}
+				maxlength={field.maxLength}
+				class={inputClasses}
+				disabled={disabled}
+			/>
+		)
+	}
+
+	{
+		field.type === "number" && (
+			<input
+				type="number"
+				id={name}
+				name={name}
+				value={value != null ? String(value) : ""}
+				required={field.required}
+				min={field.min}
+				max={field.max}
+				class={inputClasses}
+				disabled={disabled}
+			/>
+		)
+	}
+
+	{
+		field.type === "boolean" && (
+			<label class="flex items-center gap-2 cursor-pointer">
+				<input
+					type="checkbox"
+					id={name}
+					name={name}
+					checked={!!value}
+					disabled={disabled}
+					class="w-4 h-4 rounded border-neutral-700 bg-neutral-900 text-white focus:ring-0 focus:ring-offset-0"
+				/>
+				<span class="text-sm text-neutral-400">Enabled</span>
+			</label>
+		)
+	}
+
+	{
+		field.type === "select" && (
+			<select
+				id={name}
+				name={name}
+				required={field.required}
+				disabled={disabled}
+				class={inputClasses}
+			>
+				{!field.required && <option value="">--</option>}
+				{field.options.map((opt) => (
+					<option value={opt} selected={value === opt}>
+						{opt}
+					</option>
+				))}
+			</select>
+		)
+	}
+
+	{
+		field.type === "upload" && (
+			<p class="text-sm text-neutral-500">
+				{value ? (
+					<span class="text-neutral-300">{String(value)}</span>
+				) : (
+					"No file"
+				)}
+			</p>
+		)
+	}
+
+	{error && <p class="text-xs text-red-400">{error}</p>}
+</div>

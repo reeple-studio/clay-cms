@@ -1,0 +1,422 @@
+# Clay CMS
+
+Headless CMS integration for Astro. Adapter-based: any Drizzle-supported database, any blob store. The first shipped adapters target Cloudflare D1 and R2, and the playground demonstrates that combination, but the core has no hard Cloudflare dependency. Inspired by Payload CMS's collection-based API and config-file convention, and Astro's integration patterns.
+
+## Architecture
+
+```
+clay-cms              ← Core: types, fields.*, defineConfig, resolve, validate, auth, actions, admin pages, local API, integration
+@clay-cms/drizzle     ← Shared: buildSchema(), createCrud() — dialect-agnostic
+  ^
+  |
+@clay-cms/db-d1       ← D1 adapter (SQLite dialect): sqliteTable + drizzle-orm/d1 + DrizzleAccessor. Cloudflare-bound, no db.transaction.
+@clay-cms/db-libsql   ← libSQL/Turso adapter (SQLite dialect): @libsql/client driver, env-based conn. Adds interactive db.transaction (cms.transaction(fn) works) + db.batch.
+@clay-cms/storage-r2  ← R2 storage adapter: file upload/serve via R2 bindings
+
+playground/           ← Astro 7 + Cloudflare adapter demo (one possible deployment target)
+```
+
+- **Adapter pattern**: `DatabaseAdapterResult` / `StorageAdapterResult` are factories. `init()` receives resolved collections and returns the adapter instance. DB adapters expose `drizzle?: DrizzleAccessor`, `drizzleModuleCode`, and `generateInitSQL` for auto-table-creation. `DrizzleAccessor.schemaConfig` carries the dialect-specific `SchemaBuilderConfig` (table factory + semantic column builders) so `runtime/api.ts` stays dialect-agnostic — the adapter ecosystem is the dialect registry, no hardcoded provider switch.
+- **Collection system**: plain `CollectionConfig` objects + `fields.*` API. `resolveCollections()` merges system/upload/auth fields. `validateCollections()` runs boot-time checks.
+- **Schema layer**: `@clay-cms/drizzle` is dialect-agnostic — it takes a `tableFactory` + `columns` config so it works with any Drizzle dialect, not just SQLite. Also provides `generateCreateStatements()` for DDL generation. Generates `_sessions` system table when auth collections exist.
+- **Semantic column vocabulary**: `ColumnBuilders` exposes six builders — `text`, `integer`, `real`, `boolean`, `timestamp`, `json`. `(name) => ColumnBuilder`, no options bag. `schema.ts` only calls these; dialect-specific knobs (`{ mode: "boolean" }`, `{ mode: "json" }`) live in the adapter. JS-shape contract: `text`→`string`, `integer`→`number`, `real`→`number` (float), `boolean`→`boolean`, `timestamp`→ISO-8601 **string** (not `Date`), `json`→parsed JS value. The `number` field type lowers to **`real`** (JS numbers are floats; `integer` is reserved for ids/counters/system columns — on SQLite both round-trip, but `integer` would truncate on Postgres). D1 lowers `boolean`→`integer({mode:"boolean"})`, `timestamp`→`text`, `json`→`text({mode:"json"})`.
+- **Shared SQLite adapter vocabulary**: the SQLite lowering (the six builders + the `schemaConfig` object, in both typed and raw-source-string form) lives once in `@clay-cms/drizzle/sqlite.ts` (`sqliteSchemaConfig`, `sqliteSchemaModuleSource`). Every SQLite-family adapter (D1, libSQL, the better-sqlite3 conformance prototype) imports it instead of re-declaring — so the runtime `schemaConfig` and the DDL-time config can't drift. The legacy imperative `DatabaseAdapter` surface (`init()` → find/create/…) was **removed from the adapters** (dead — the runtime CRUD path goes through the `drizzle` accessor); `DatabaseAdapterResult.init` is now optional.
+- **Auth**: collection-level (`auth: true`), no external library — `bcryptjs` + session tokens in `_sessions`. Auth logic in `packages/clay-cms/src/auth/` (shipped as source).
+- **Local API**: see Local API + Access Control sections below.
+
+## Integration entry & config-file convention (Payload-style)
+
+The integration is **zero-arg** in `astro.config.mjs`. All CMS config lives in a separate `clay.config.ts` at the project root, discovered automatically by the integration via `jiti`.
+
+```ts
+// astro.config.mjs
+import clay from "clay-cms";
+export default defineConfig({
+  output: "server",
+  adapter: cloudflare(),
+  integrations: [clay()],   // auto-discovers ./clay.config.ts
+});
+```
+
+```ts
+// clay.config.ts — single source of truth
+import { defineConfig, fields } from "clay-cms/config";
+import { d1 } from "@clay-cms/db-d1";
+import { r2 } from "@clay-cms/storage-r2";
+import { posts } from "./src/collections/posts.ts";
+import { users } from "./src/collections/users.ts";
+
+export default defineConfig({
+  db: d1({ binding: "CLAY_DB" }),
+  storage: r2({ binding: "CLAY_BUCKET" }),
+  collections: [posts, users],
+  admin: { user: users.slug },
+  localization: { locales: ["en", "fr"], defaultLocale: "en" },
+});
+```
+
+Discovery order: `clay.config.ts` → `clay.config.mjs` → `clay.config.js`. Override via `clay({ configPath: "..." })`.
+
+## Integration internals (handlers/)
+
+`integration.ts` is a thin coordinator (~94 lines). Each cross-cutting concern lives in its own handler under `src/handlers/`:
+
+```
+src/
+  integration.ts                ← coordinator: load config, sequence handlers
+  handlers/
+    load-config.ts              ← jiti-based clay.config.ts loader
+    vite.ts                     ← Tailwind v4 + drizzle alias
+    virtuals.ts                 ← hand-rolled Vite virtual-module plugin (uses builder)
+    routes.ts                   ← injectRoute + addMiddleware
+    types.ts                    ← injectTypes + .d.ts content
+    logging.ts                  ← astro:server:setup banner + db.init
+    virtual-builder.ts          ← VirtualBuilder factory (json/reexport/raw)
+  runtime/
+    api.ts                      ← cms proxy (shipped as source)
+    init-sql.ts                 ← ensureTables (shipped as source)
+```
+
+The integration is a **plain native `AstroIntegration` factory** — `clay()` returns `{ name, hooks }` directly, no `astro-integration-kit` (dropped for Astro 7 support; the kit is deprecated and peers cap at Astro 6). Handlers are plain functions taking `(params, ctx)` — keeps types simple under `exactOptionalPropertyTypes`. `virtuals.ts` registers a hand-rolled Vite plugin (`resolveId` tags known ids with a leading `\0`, `load` returns the pre-built source) via `updateConfig({ vite: { plugins } })`, replacing the kit's `addVirtualImports`; `vite.ts` inlines the tailwind-dedupe check (`config.vite.plugins` name-match) that the kit's `hasVitePlugin` used to provide; runtime source paths use `fileURLToPath(new URL("../src/runtime/…", import.meta.url))` (the resolve is inlined into `dist/integration.js`, so the single `..` climbs `dist/` → package root → `src/`). The `astro:config:setup` hook is async because it awaits `loadClayConfig`. Shared state (`userConfig`, `resolved`) lives in a closure populated by `config:setup` and reused by `config:done` + `server:setup`.
+
+## Conventions
+
+- **`Astro.locals` namespace**: all keys Clay assigns to `Astro.locals` are prefixed `clay*` to avoid clashing with consumer apps — `clayUser`, `claySession`. (No `clayCms` wrapper — there's a single `cms` import; consumers thread `user: Astro.locals.clayUser` explicitly.)
+- **ESM only**, no CJS. All packages use `"type": "module"`.
+- **tsup** for all builds. Entry pattern: `src/**/*.(ts|js)` (excluding `*.spec.ts`). Peer + regular deps are externalized.
+- **Biome** for linting/formatting (not ESLint/Prettier). Run `pnpm lint:fix` to auto-fix.
+- **pnpm workspaces** (pnpm 11, pinned via `packageManager`). Use `workspace:*` for inter-package deps. pnpm 11 no longer reads the `pnpm` field in `package.json` — all workspace settings live in `pnpm-workspace.yaml`: the native-build allowlist is `allowBuilds:` (a `{name: true|false}` map — `better-sqlite3`/`esbuild`/`workerd` are `true`, `sharp` is `false`, replaces the old `onlyBuiltDependencies` list; `strictDepBuilds` is on by default so unlisted scripts throw), transitive-version pins are `overrides:` (currently the esbuild/kysely Dependabot fixes), and `minimumReleaseAge:` is the supply-chain quarantine (temporarily 4h, see ROADMAP).
+- Prefer **tabs** for indentation (Biome default).
+
+## TypeScript
+
+- `clay-cms` extends `astro/tsconfigs/strictest` — this enables `exactOptionalPropertyTypes: true`.
+- You CANNOT assign `T | undefined` to optional props. Use conditional assignment:
+  ```ts
+  // WRONG: labels: collection.labels,
+  // RIGHT:
+  if (collection.labels) { resolved.labels = collection.labels; }
+  ```
+- Other packages use a simpler strict tsconfig without Astro's extras.
+- tsup handles JSON imports (`import { peerDependencies } from "./package.json"`) fine even though the TS editor warns.
+
+## Commands
+
+```sh
+pnpm install                        # install all workspace deps
+pnpm --filter clay-cms build        # build core (must build first — others depend on it)
+pnpm --filter @clay-cms/drizzle build
+pnpm --filter @clay-cms/db-d1 build
+pnpm --filter playground dev        # start Astro dev server
+pnpm dev                            # all packages in watch mode + playground
+pnpm test                           # run all tests (vitest)
+pnpm lint:fix                       # biome auto-fix
+```
+
+Build order matters: `clay-cms` → `@clay-cms/drizzle` → `@clay-cms/db-d1` → playground.
+
+## Design Philosophy
+
+- **Payload CMS influence**: dedicated `clay.config.ts` file as single source of truth, collection-based config, upload as collection flag, auth as collection flag, field types as discriminated unions, `relationTo` for upload refs.
+- **Adapter-based, runtime-agnostic core**: the CMS itself is not tied to any host. Databases plug in as `DatabaseAdapterResult` factories (D1 and libSQL today; Postgres/MySQL are the same shape), storage plugs in as `StorageAdapterResult` (R2 today). Runtime code uses Web-standard APIs only — no Node.js built-ins — so it can execute anywhere Astro SSR runs, including edge runtimes like workerd. Node APIs are fine in integration handlers, which run at config time.
+- **Minimal surface**: don't add abstractions until needed. Three similar lines > premature helper.
+- **Astro integration**: the CMS is a native Astro integration — a plain factory returning `{ name: "clay-cms", hooks }`, no third-party integration framework. Config validation happens at integration setup time, not runtime.
+
+## Field Types
+
+`text`, `number` (→ `real` column, float-safe), `boolean`, `select` (options array), `upload` (relationTo → upload collection slug). System fields (id, createdAt, updatedAt), upload fields (filename, mimeType, filesize, url, width, height), and auth fields (email, hashedPassword) are auto-merged by `resolveCollections()`. **Reserved fields win**: `resolveCollections()` spreads system/upload/auth fields **after** the user's, so a user field can't shadow a reserved one (e.g. redefining `hashedPassword` without `hidden`); `validateCollections()` additionally **rejects** such collisions at boot with a clear error. **Slug + field-name format** is validated at boot (`/^[a-z][a-z0-9_-]*$/` for slugs, letter-led for fields) along with **derived-type-name collisions** (two slugs → same PascalCase, e.g. `post`+`posts`→`Post`) — this closes the TypeGen invalid-`.d.ts` hole (the codegen also quotes any non-identifier property key defensively, and emits `hidden` fields as optional since they're absent from reads unless `showHiddenFields`).
+
+## Authentication
+
+- **Collection-level auth**: any collection can have `auth: true` (like Payload CMS). v1 requires exactly one auth collection.
+- **`admin.user` (required)**: top-level config explicitly designates which auth collection backs the dashboard, e.g. `admin: { user: users.slug }` (Payload-style). Validated at boot: must reference an existing collection with `auth: true`. This replaces an earlier implicit `collections.find(c => c.auth)` scan and becomes the sole entry point for auth flows in middleware/actions, which import it via `config.admin.user` from `virtual:clay-cms/config`.
+- **No external auth library** — `bcryptjs` for password hashing, random session tokens in `_sessions` DB table.
+- **No API routes** — all auth flows (setup, login, logout) go through Astro Actions with built-in CSRF protection.
+- **Actions**: defined in `packages/clay-cms/src/actions.ts` (shipped as source, not compiled by tsup). Users re-export: `export { server } from "clay-cms/actions"` in their `src/actions/index.ts`.
+- **Auth fields auto-merged**: `email` (unique, required) + `hashedPassword` (required). Users define additional fields (name, role, etc.) in their collection config.
+- **Session management**: `_sessions` table with random 32-byte tokens (via `crypto.getRandomValues()`), stored hashed (see above). 30-day expiry. Cookie: `clay-cms.session` (`__Host-` prefixed in prod).
+- **Auth utilities**: `packages/clay-cms/src/auth/` — `password.ts` (hash/verify + `fakeVerifyPassword`), `session.ts` (create/validate/delete + cookie helpers + token hashing), `rate-limit.ts` (`checkRateLimit`), `types.ts`. Shipped as source, exported via `clay-cms/auth`.
+- **First-user flow**: admin middleware detects zero users → redirects to `/admin/setup`. Setup is an **atomic singleton insert** — `cms.create({ requireEmpty: true, overrideAccess: true })` lowers to `INSERT … SELECT … WHERE NOT EXISTS`, so two concurrent setups with different emails can't both create an admin (the loser gets `null` → generic "Setup unavailable." error, no state disclosure). Still **force-assigns `role: "admin"`** to the first user, ignoring any client-supplied role.
+- **Login hardening**: **constant-time** — the not-found branch runs `fakeVerifyPassword()` (bcrypt against a compiled-in constant hash) so response latency can't reveal whether an email exists; unknown-email and wrong-password return the identical error. **Session rotation** — the caller's prior cookie session is deleted before `createSession` (kills a pre-login token, session-fixation defense). **Email normalization** — setup + login `.trim().toLowerCase()` the email in the Zod schema so the case-sensitive SQLite `UNIQUE` can't hold two variants and login always matches the stored value. **Password cap** — setup enforces `.max(72)` (bcrypt's effective limit; login stays uncapped since `bcrypt.compare` truncates too). **Rate-limit clear-on-success** — a successful login `clearRateLimit()`s its per-IP bucket so a shared NAT/office IP isn't locked out by its own logins (also prunes the row).
+- **`showHiddenFields` is system-only**: the proxy forwards `showHiddenFields` to CRUD **only under `overrideAccess: true`**. A gated caller passing it is ignored — so a logged-in user can never use it to exfiltrate `hashedPassword` (which is protected by `hidden: true`, not a field-level read rule). Login's user lookup uses `overrideAccess: true` + `showHiddenFields: true` as intended.
+- **Cookie deletion mirrors `secure`/`__Host-`**: `deleteSessionCookie` passes `secure: isProd()` — a `__Host-`-prefixed cookie set-for-deletion without `Secure` is rejected by the browser, leaving a stale cookie client-side.
+- **Session tokens hashed at rest**: `_sessions.token` stores a **SHA-256 hash** (Web Crypto `subtle`, workerd-safe); the plaintext lives only in the cookie. `createSession` returns plaintext for the cookie, `validateSession`/`deleteSession` hash the cookie value before lookup. A DB read (SQL leak, backup exfil) exposes only digests.
+- **Cookie**: `httpOnly` + `sameSite=lax` always; `secure` is `import.meta.env.PROD`-conditional (unconditional `secure` silently breaks HTTP-localhost dev), and prod uses the `__Host-clay-cms.session` prefix. The name is computed identically wherever the cookie is set/read/deleted.
+- **Rate limiting**: `_rate_limits` system table (auto-created alongside `_sessions` when auth collections exist) + `checkRateLimit()` in `auth/rate-limit.ts` (fixed-window, best-effort, DB-backed so it stays runtime-agnostic — no Cloudflare-specific primitive). Login 5/15min, setup 3/hour, per-IP (`context.clientAddress`, shared-bucket fallback). A rate-limit hit returns the same generic error as bad credentials.
+- **Two middlewares**:
+  - **Global session middleware** (`src/runtime/session-middleware.ts`, `pre`, every request): `ensureTables()`, reads/validates cookie, populates `locals.clayUser` + `locals.claySession`. Never redirects — lets Clay back public-facing auth, not just admin.
+  - **Admin guard** (`src/admin/middleware.ts`, `post`, `/admin/*` only): reads `locals.clayUser`, handles setup/login redirects, runs `access.admin`. No cookie reading here.
+- **Auto-table-creation**: on first request the session middleware runs `CREATE TABLE IF NOT EXISTS` for all collection tables + `_sessions`. SQL is generated at config time by the adapter's `generateInitSQL()` and baked into `virtual:clay-cms/config` as a JSON array.
+
+## Access Control
+
+Per-collection ACL inspired by Payload + Kide. Lives in `packages/clay-cms/src/access/`, exported via `clay-cms/access`.
+
+### Shape
+
+```ts
+import { fields, defineCollection } from "clay-cms/config";
+import { isLoggedIn, isAdmin, isSelf, or } from "clay-cms/access";
+
+export const users: CollectionConfig = {
+  slug: "users",
+  auth: true,
+  fields: {
+    name: fields.text({ required: true }),
+    role: fields.select({ options: ["admin", "editor", "customer"], required: true }),
+  },
+  access: {
+    // ? per-op; missing ops fall back to tiered defaults — you can specify just one
+    update: or(isAdmin, isSelf),
+  },
+};
+```
+
+### Operations & context
+
+Five ops: `read`, `create`, `update`, `delete`, `admin`. Each access fn receives `{ user, operation, collection, id?, doc? }` and returns `boolean | Where | Promise<...>` (Payload parity). `user` is `null` for anonymous requests, never `undefined` inside an enforced call.
+
+**Where-returning access** lets a rule say "allowed, but only for matching docs" without per-call-site filtering. `find` AND-merges the ACL `Where` with `opts.where`. `findOne`/`update`/`delete` load the doc (already needed for the gate) and run `matchesWhere(aclWhere, doc)`. `create` runs `matchesWhere` against incoming data.
+
+The same `Where` type powers ACL v2, `find({ where })`, and the (future) admin filter UI. Two evaluators share it: `matchesWhere()` in `clay-cms/access` (in-memory, gates `findOne`/`update`/`delete`/`can()`) and `whereToDrizzle()` in `@clay-cms/drizzle` (SQL, gates `find`). Operators: `equals`, `not_equals`, `in`, `not_in`, `exists`, `greater_than(_equal)`, `less_than(_equal)`, `like` (case-insensitive substring, Payload semantics), `contains`, plus `and`/`or`. **The two evaluators must agree** — pinned by cross-evaluator parity tests: `not_equals`/`not_in` are **NULL-inclusive** on both sides (SQL emits `or(ne(col,v), isNull(col))` since bare `col != v` is UNKNOWN for NULL and would exclude the row the in-memory side matches), and a **non-array** `in`/`not_in` operand **fails closed** on both sides (SQL emits `1 = 0` instead of dropping the clause, which used to let a malformed ACL leak the whole table on `find`). Dot-paths and localized-field filtering deferred.
+
+The `admin` op is **only meaningful on auth collections** — it gates dashboard entry. Replaces what would otherwise be a string-based `requireRole` config; same primitive as the other ops.
+
+### Helpers
+
+`clay-cms/access` exports: `isLoggedIn`, `isAdmin` (`user?.role === "admin"`), `isSelf`, `and`, `or`, `not`, `ownDocuments(field)` (returns a `Where` filtering on the user id — the storefront-pattern killer), and `andWhere`/`orWhere` for raw `Where` merging. Plus the `AccessDeniedError` class and the types `AccessFn`/`AccessResult`/`AccessContext`/`CollectionAccess`/`Where`/`WhereOperator`.
+
+The `and`/`or` combinators handle the cross product of `boolean` and `Where` results: in `or`, `true` short-circuits (most permissive wins); in `and`, `false` short-circuits; mixed Wheres accumulate into `{ and: [...] }` / `{ or: [...] }`. `not()` is boolean-coerced — negating a `Where` is ill-defined and not supported.
+
+The north-star pattern is one line: `read: or(isAdmin, ownDocuments("customer"))`.
+
+### Tiered defaults (filled by `resolveCollections`)
+
+- **Content collections** (`auth` falsy): `read = () => true`, `create/update/delete = isLoggedIn`. No `admin` op.
+- **Auth collections** (`auth: true`): `read = isLoggedIn`, `create = isAdmin`, `update = or(isAdmin, isSelf)`, `delete = and(isAdmin, !isSelf)`, `admin = isAdmin`.
+
+User-supplied access merges per-op against these defaults — defining only `update` does NOT wipe the others.
+
+### Single CMS surface, secure by default
+
+There is one `cms` import — `import cms from "virtual:clay-cms/api"` — and every call enforces the gate. The caller threads `user` explicitly:
+
+```ts
+// public storefront / admin page / action — same shape
+await cms.orders.find({ user: Astro.locals.clayUser });
+
+// trusted system code — explicit bypass (rare: bootstrap, login, seed scripts)
+await cms.users.create({ data, overrideAccess: true });
+```
+
+The single gate rule inside the proxy:
+
+```
+if (opts.overrideAccess === true) → bypass
+otherwise                         → enforce, ctx.user = opts.user ?? null
+```
+
+**Forgetting `user` is denied, not leaked.** A missing `user` key is enforced as anonymous (`null`), so a typo or oversight can never silently bypass ACL. The only way to skip the gate is `overrideAccess: true`, which is grep-able.
+
+`overrideAccess: true` means **act as root**. Use it sparingly and intentionally — every call site is an audit point. Today's only legitimate uses inside Clay itself are: `actions.ts` setup (creates the first admin pre-auth), `actions.ts` login (looks up the user by email pre-auth), and `admin/middleware.ts` (the bootstrap users-exist check). User-land equivalents: seed scripts, migrations, hooks that need to read across users.
+
+### Immutable invariants: auth-collection deletes + admin demotes
+
+The proxy enforces rules on auth collections that **cannot be disabled** (not even by user-supplied `access`):
+
+- **delete**: (1) you cannot delete your own account, (2) you cannot delete the last user.
+- **update**: (1) you cannot demote your own admin account (role admin → non-admin), (2) you cannot demote the last admin, (3) **you cannot grant the admin role unless you are an admin** — the mirror of the demotion guard, closes non-admin self-promotion via the default `update = or(isAdmin, isSelf)`.
+
+The count-based demote/delete guards hold **even when a non-default `locale` is passed** — `requireOther` writes route through the guarded (non-localized) CRUD path, so `locale: "fr"` can't bypass the invariant. This is the original bug the whole ACL system was built to make impossible. The policy + disambiguated error messages live in `runtime/api.ts` (a runtime invariant, not a default). **The count-based half is race-free**: rather than a pre-flight `find()` + check (a TOCTOU window — two concurrent deletes/demotes could both pass a stale count), the "another row/admin still exists" test is ANDed into the write's own `WHERE` inside `@clay-cms/drizzle/crud.ts` via the `requireOther: { where? }` CRUD option — `delete`/`update` use `.returning()`; an empty result means the guard refused, and the proxy translates that into `AccessDeniedError`. `requireOther` reuses `whereToDrizzle`, so CRUD carries no auth knowledge. Self-delete/self-demote stay cheap local comparisons (no race).
+
+### Errors
+
+Denied calls throw `AccessDeniedError` (carries `collection`, `operation`). Admin pages catch → 403. Actions catch → `ActionError({ code: "FORBIDDEN" })`.
+
+### `can()` — pre-flight permission check
+
+`cms.<slug>.can(op, opts)` runs the gate, catches `AccessDeniedError`, and returns boolean. Pass `user: Astro.locals.clayUser` like any other call. Used by the admin UI to hide buttons the user can't act on (e.g. don't render Save when `update` is denied for this doc). For ops that need a doc (read/update/delete), pass `{ id }` and it loads the doc, or pass `{ doc }` directly. Per-op rather than bulk — if the admin UI ever needs a bulk permissions object, add an `access()` method then.
+
+### Field-level access
+
+Per-field `access.read`/`create`/`update` on any `FieldConfig`. Boolean-only (Payload parity — `Where` stays collection-level). Lives on `BaseField`. `isLoggedIn`/`isAdmin` are dual-typed (`AccessFn & FieldAccessFn`) so they work in both slots; `isSelf`/`ownDocuments` stay collection-only.
+
+Three runtime helpers in `clay-cms/access`, all working off the resolved field map:
+- `applyReadFieldAccess(collection, doc, user)` — strips `read`-denied fields. Called per-doc in `find()` (after `afterRead` hooks) and `findOne()`. Returns a new object.
+- `applyWriteFieldAccess(collection, data, op, user, existing?)` — drops denied fields silently, `console.warn`s in dev. Runs **before** `beforeChange` so hooks can't smuggle values past the gate.
+- `evaluateFieldAccess(collection, doc, user)` — returns `Map<fieldName, { canRead, canUpdate }>`. Used by the admin edit page: read-denied don't render, update-denied render `disabled`.
+
+**Hot-path skip.** `resolveCollections()` sets `hasFieldLevelAccess?: { read?, create?, update? }` at boot; the gate consults it before calling helpers. Zero cost when unused.
+
+**Silent drop, not throw** (Payload parity): forms can submit without mirroring user perms. Dev `console.warn` catches typos. **`overrideAccess: true` skips field gate too.**
+
+**Hook ordering vs field-level ACL:**
+- Read: CRUD → `beforeRead` → `afterRead` → field strip → consumer.
+- Write: field drop → `beforeChange` → CRUD → `afterChange` → **read-field strip** → consumer. The write path strips read-denied fields from the returned doc too, so a user with write-but-not-read on a field never sees it echoed back. `overrideAccess: true` skips both.
+
+Field-level *hooks* deferred — same field-walk machinery will be reused.
+
+## Virtual modules (config-time → runtime bridge)
+
+Astro integration hooks run at build/config time in Node. SSR code may run in a different runtime (e.g. workerd under `@astrojs/cloudflare` v13, where `globalThis` is not even shared with the Node-side hooks). Virtual modules are how config-time data and adapter-provided code cross that boundary in a host-agnostic way.
+
+There are **four** virtual modules:
+
+- **`virtual:clay-cms/drizzle`** — adapter-provided code that lazily initializes a Drizzle instance from whatever the host exposes (e.g. Cloudflare bindings for the D1 adapter). `drizzleModuleCode` is a raw JS string the adapter exposes.
+- **`virtual:clay-cms/api`** — one-line re-export of `src/runtime/api.ts` (the cms proxy). Real, type-checked TS file shipped as source.
+- **`virtual:clay-cms/init-sql`** — one-line re-export of `src/runtime/init-sql.ts` (`ensureTables()`). Real TS file shipped as source.
+- **`virtual:clay-cms/config`** — **generated bridge module**. Imports the user's `clay.config.ts` as a real ESM module (Vite bundles it into the workerd build, so collection hook closures, validators, and any user functions ride along untouched), calls `resolveCollections()` at runtime, and exposes `{ collections, localization, admin, initSqlStatements }`. `admin` is the user's `AdminConfig` (`{ user: <slug> }`) — the explicit pointer to the auth-enabled collection that backs the dashboard. `initSqlStatements` is the only thing baked in as JSON because it's pure data computed at config time by the db adapter.
+
+No separate hooks codegen module — the user's `clay.config.ts` is imported directly, so hook closures ride along untouched.
+
+## Local API
+
+- **Options-bag everywhere.** `CrudOperations` (the `@clay-cms/drizzle` boundary every adapter implements) is `find(slug, opts?)` / `findOne(slug, opts)` / etc., not positional. Same shape on the proxy. Adding new knobs (`select` / `limit` / `sort` / `populate`) is one key in the bag, not a new positional. Migrated as prep for `select` — done before adapter #2 ships so the next adapter slots in without churning every call site.
+- **Atomic write guards** (security-hardening slice): `create({ requireEmpty: true })` → `INSERT … WHERE NOT EXISTS` (bootstrap singleton, returns `null` if a row exists); `delete`/`update({ requireOther: { where? } })` → the write only lands if another matching row still exists, checked atomically in the WHERE. These are the race-free mechanic behind the auth-collection invariants (see Access Control) and reuse `whereToDrizzle`, so CRUD stays auth-agnostic. `delete` returns `boolean` (did a row go).
+- **Kide-style**: `cms.posts.find()`, `cms.admins.create({ data: {...} })` — collection as dot-notation property.
+- **Virtual module**: `virtual:clay-cms/api` — available in all SSR code (middleware, actions, Astro pages, user app).
+- **Proxy-based**: runtime uses a `Proxy` that maps `cms[slug]` to `{ find, findOne, create, update, delete }` methods backed by the CRUD layer.
+- **Hooks**: read at request time from a slug→config map built once at module init from the imported collections array. Closures preserved because collections come from a real ESM import of `clay.config.ts` (no JSON serialization).
+- **Internal helpers**: `cms.__tables()` (raw drizzle tables), `cms.__db()` (raw drizzle db) — used by auth middleware/actions, not part of public API. The admin user collection slug comes from `config.admin.user` (imported from `virtual:clay-cms/config`), not from the cms proxy.
+- **Types**: per-collection interfaces generated at config time, injected via `injectTypes`. No CLI step. Each slug gets a PascalCase `Doc` (`posts` → `Post`) plus `PostCreateInput` (`Omit<Post,"id"|"createdAt"|"updatedAt">`) and `PostUpdateInput` (`Partial<CreateInput>`). `CMS` interface maps slugs → `CollectionAPI<Doc, CreateInput, UpdateInput>`. Field→TS: `text`→`string`, `number`→`number`, `boolean`→`boolean`, `select`→string-literal union (`Array<...>` if `multiple`), `upload`→`string` (id). Required fields are non-optional.
+- **`Locale` autocomplete**: TypeGen emits `export type Locale = "en" | "fr"` (the union of `localization.locales`) and uses it on `find/findOne/create/update`'s `locale?: Locale`. When localization isn't configured the type is `never`, so passing one is a TS error — matches the runtime, which ignores it. Migrating no-localization → localization auto-widens the union.
+- **Field projection (`select`)**: Payload-shaped. `cms.posts.find({ select: { title: true } })` (include) returns only listed fields plus system fields (`id`/`createdAt`/`updatedAt`). `cms.posts.find({ select: { content: false } })` (exclude) omits the listed fields, keeps everything else. Mixing modes throws. Generic `find<S>`/`findOne<S>` in the `.d.ts` returns `Project<Doc, S>` so const-as-written selects narrow the return type to `Pick<Doc, K | SystemField>` or `Omit<Doc, K>`. Lowering lives in `@clay-cms/drizzle/resolveSelect()` — builds a column allowlist and a drizzle column-map so `db.select({ ... }).from(table)` actually narrows the SQL on the wire. Two structural wins beyond bandwidth: (a) **skip-join** when no localized field is in the projection — non-default-locale reads bypass the `_translations` LEFT JOIN entirely, regression-pinned by a test that drops the translations table mid-flight before the projected find; (b) on Postgres/libsql adapters, projecting only indexed columns enables index-only scans for free. **`select` is a perf knob, not a security boundary.** Read-denied fields are still stripped *after* projection. Hook order with `select`: CRUD (with column projection) → `beforeRead` → `afterRead` → field strip → consumer. Bypass mode (`overrideAccess: true`) skips ACL but not `select`. Today the join path post-filters rows on the result side rather than building a nested column-map select — bandwidth wins are full on the default-locale path, partial on join, structural skip-join applies regardless. Deferred: nested select for relationships, `defaultPopulate`-style per-collection defaults.
+- **Auto-regeneration**: `loadClayConfig` enumerates `jiti.cache` and returns every loaded project file; integration calls `addWatchFile` on each, so editing any imported file restarts Astro → types regenerate. jiti uses `moduleCache: false`.
+- **Dialect-agnostic**: `runtime/api.ts` imports zero dialect-specific drizzle packages. It reads `drizzle.schemaConfig` from the adapter's virtual module and passes it through to `buildSchema()`. Any future db adapter (db-postgres, db-libsql) ships its own `drizzleModuleCode` exporting a flavored `schemaConfig` and works without touching this file.
+
+## Hooks
+
+Per-collection lifecycle hooks, Payload-shaped but runtime-agnostic. Lives on the `hooks` field of `CollectionConfig`. All hooks are arrays, all are optional, all are async-aware.
+
+### Surface
+
+Six hooks, day one. Field-level hooks, `beforeOperation`/`afterOperation`, `beforeValidate`, and auth hooks (`beforeLogin`, etc.) are deferred — same "collection-first, field-second" deferral as field-level ACL.
+
+| Hook | Fires | Args | Return |
+|---|---|---|---|
+| `beforeChange` | before create + update | `{ data, originalDoc?, operation, collection, user, context, id? }` | new `data` (or `void` to keep) |
+| `afterChange` | after create + update | `{ doc, previousDoc?, operation, collection, user, context, id? }` | `void` |
+| `beforeRead` | per-doc, before projection | `{ doc, collection, user, context }` | new `doc` (or `void`) |
+| `afterRead` | per-doc, after projection | `{ doc, collection, user, context }` | new `doc` (or `void`) |
+| `beforeDelete` | before delete | `{ id, doc, collection, user, context }` | `void` |
+| `afterDelete` | after delete | `{ id, doc, collection, user, context }` | `void` |
+
+`originalDoc` / `previousDoc` are present only on update — and free, because the ACL gate already loads the existing doc. `id` mirrors that.
+
+### Differences from Payload
+
+- **No `req` object** — runtime-agnostic core. `user` is top-level; Astro state goes through `context`.
+- **No `req.payload`** — hooks just `import cms from "virtual:clay-cms/api"`.
+- **`user` is `null`, never `undefined`** (anonymous + raw-import bypass both → null).
+- **Bypass still runs hooks.** `overrideAccess: true` skips the access gate, NOT business logic. Hooks fire in the proxy (not CRUD) so every entry point runs them. Hook order/mutation/throw-to-abort/per-doc read hooks are all Payload-shaped — mental model transfers 1:1.
+
+### `context` — per-operation scratchpad
+
+Every hook receives a `context: Record<string, unknown>`. The same object is threaded through every hook in one top-level operation (e.g. `beforeChange` → CRUD write → `afterChange` see the *same* reference). Mint fresh `{}` per op when the caller doesn't supply one; or pass your own:
+
+```ts
+await cms.posts.update({ id, data, context: { skipNotify: true, requestId: "abc" } });
+```
+
+Use it for recursion guards (`if (context.skipNotify) return`), diffing between before/after, or stashing host state without polluting hook signatures.
+
+### Hot-path skip
+
+`find()` skips the per-doc read-hook loop entirely on collections that define neither `beforeRead` nor `afterRead`, returning rows directly from CRUD with no allocation. Pay only when you opt in.
+
+### Gotchas
+
+- **`after*` rollback depends on the adapter.** Throwing `afterChange`/`afterDelete` rolls back **only inside `cms.transaction(fn)` on adapters whose drizzle driver supports interactive transactions** (libsql/postgres/better-sqlite3). D1 has no `db.transaction`, so use `before*` for anything that must abort. The localized orphan-row hole is closed independently via `db.batch()` in CRUD (see Transactions).
+- **Hook order = array order**, sequential, awaited. Each receives previous return.
+- **Read hooks run per-doc inside `find()`** — N calls per find.
+- **Bypass `update`/`delete` lazily loads `existing`** when hooks are defined, so `originalDoc`/`doc` are always present.
+
+## Transactions
+
+Atomicity story is split across two layers — `db.batch()` inside CRUD (always on, fixes the corruption bug) and `cms.transaction(fn)` on top of `db.transaction` (opt-in, full Payload-style rollback semantics where the driver supports it).
+
+### `db.batch()` inside CRUD — always on
+
+Localized `create`/`update`/`delete` write to two tables (the main row and `_translations`). Pre-P0-#4, those were two separate awaits, so a failure on the second left an orphan main row — silent corruption. As of the transaction slice, `@clay-cms/drizzle/crud.ts` builds both statements, then routes them through `db.batch([s1, s2])` when the drizzle driver exposes one. drizzle-orm's D1 driver does, so the playground (the only place this matters today) gets atomic localized writes for free, no API change. Drivers without `.batch()` (better-sqlite3 in tests) fall back to sequential awaits — same behavior as before. Ships the orphan-row fix on D1 today, regardless of whether anyone calls `cms.transaction(fn)`.
+
+### `cms.transaction(fn)` — Payload-style atomic block
+
+```ts
+import cms from "clay-cms/api";
+
+await cms.transaction(async (tx) => {
+  const order = await tx.orders.create({ data, user: Astro.locals.clayUser });
+  await tx.inventory.update({ id: order.itemId, data: { stock: 0 }, overrideAccess: true });
+  // ? a throw here — including from an afterChange hook on either op — rolls back BOTH writes
+});
+```
+
+- `tx` is a cms-shaped proxy sharing a tx-bound drizzle instance. **Not a stealth bypass** — calls still enforce the gate, you still thread `user`/`overrideAccess`. Refuses nesting (savepoints deferred).
+- **Feature-detected** via `typeof db.transaction === "function"` — no `DatabaseAdapter` method, no provider switch. D1 throws a clear error rather than lie about rollback. Payload's `beginTransaction → null` opt-out, JS-flavored.
+- **Rollback covers `after*` hooks** because hooks fire in the proxy — closes the gotcha on tx-supporting adapters.
+- **No `req.transactionID`** — per-op `context` + drizzle tx closure handle it; hook signatures stay clean.
+
+## Admin UI
+
+- Routes are injected via `injectRoute` in `astro:config:setup` — one `.astro` file per route (not a catch-all).
+- Admin files live in `packages/clay-cms/src/admin/` — structured like a mini Astro app:
+  ```
+  src/admin/
+    index.astro              ← dashboard (protected by middleware)
+    setup.astro              ← first-user creation form
+    login.astro              ← email/password login form
+    middleware.ts            ← auth guard (injected via addMiddleware)
+    components/
+      BaseHead.astro         ← charset, viewport, noindex/nofollow, title
+    layouts/
+      BaseLayout.astro       ← uses BaseHead, imports Tailwind CSS
+    styles/
+      styles.css             ← @import "tailwindcss" + @source for admin .astro files
+  ```
+- `.astro` files are shipped as source (not compiled by tsup). They're included via `"files": ["src/admin"]` and route entrypoints are exported in `package.json`.
+- Tailwind v4 is registered via `@tailwindcss/vite` in the integration (a local `config.vite.plugins` name-match dedupe check avoids duplicate registration — replaces the `hasVitePlugin` helper the deprecated `astro-integration-kit` used to inject).
+- `@source "../**/*.astro"` in `styles.css` tells Tailwind to scan admin files inside `node_modules`.
+- Admin pages use the local API (`cms[slug].find()`) to fetch documents for all collections including auth.
+- `hashedPassword` is excluded from display columns in the admin UI.
+- **Security headers**: `admin/middleware.ts` wraps every `/admin/*` response (page, redirect, 403) with `Content-Security-Policy` (`script-src 'self'`, `frame-ancestors 'none'`, `style-src 'self' 'unsafe-inline'` for Tailwind's scoped `<style>` blocks), `X-Frame-Options: DENY`, `Referrer-Policy: same-origin`, `X-Content-Type-Options: nosniff`. **`Referrer-Policy` is `same-origin`, not `no-referrer`** — `no-referrer` makes browsers send `Origin: null` on same-origin form POSTs (Fetch spec), which trips Astro's `checkOrigin` CSRF guard and 403s the login/setup forms with "Cross-site POST form submissions are forbidden". `same-origin` keeps the real `Origin` on same-origin requests while still leaking nothing cross-origin. **No inline scripts** — the list-row navigation and the delete-confirm use `data-*` attributes + bundled (`'self'`) delegated handlers, not inline `onclick` (which is both a CSP violation and, for the row, an HTML-attribute-escape XSS landmine for future user-supplied ids). New admin features must add their CSP sources explicitly.
+- **ACL-driven UI**: the document edit page calls `cms[slug].can("update"|"delete", { doc, user: Astro.locals.clayUser })` and hides Save / Delete (and disables form inputs via `FieldInput`'s `disabled` prop) when the current user can't perform the op. The Cancel link becomes "Back" in read-only mode. This is the surface-side of the access-control work — buttons react to ACL rules without per-page conditional logic beyond a single `can()` call.
+
+## Localization (Field-Level i18n)
+
+- **Config**: optional `localization: { locales: ["en", "fr"], defaultLocale: "en" }` in `clay.config.ts`
+- **Field-level opt-in**: `localized: true` on `TextField` and `SelectField` only (TS enforces this — other field types don't have the property)
+- **Storage**: default locale data lives on the **main table** (zero-JOIN reads). Non-default translations go in `{slug}_translations` sibling table.
+- **Schema**: `buildSchema()` generates `{slug}_translations` with `id`, `_parentId`, `_locale`, + localized field columns, plus `UNIQUE(_parentId, _locale)` constraint.
+- **CRUD semantics**:
+  - No `locale` / default locale → main table only (unchanged behavior)
+  - Non-default locale reads → `LEFT JOIN _translations`, overlay localized fields onto base doc
+  - Non-default locale writes → upsert into `_translations` via `onConflictDoUpdate`
+  - Delete → explicitly removes translation rows first (D1 doesn't enforce FK CASCADE)
+- **Resolve**: `resolveCollections()` sets `hasLocalizedFields: true` on collections with localized fields when localization config is present
+- **Validation**: `localized: true` without global config → error; `defaultLocale` not in `locales` → error
+- **Constraint**: default locale is immutable after content creation (v1)
+
+## Testing
+
+- **Vitest** at the workspace root. Config in `vitest.config.ts` scans `packages/*/src/**/*.spec.ts`.
+- Test files are co-located with source (`schema.spec.ts` next to `schema.ts`). tsup excludes `*.spec.ts` from builds.
+- **`@clay-cms/drizzle`**: uses `better-sqlite3` for in-memory SQLite integration tests. The `createTablesInDb` test helper introspects drizzle schema via `getTableConfig()` to generate DDL — test DB always matches what `buildSchema()` produces. Production DDL is generated by `generateCreateStatements()` in `ddl.ts` (same logic, exported for adapters to use).
+- **Test philosophy**: test the logic layer (`@clay-cms/drizzle`), not thin adapters (`db-d1`). Adapters just wire up bindings and delegate. When adding new adapters that also use `@clay-cms/drizzle`, existing tests already cover the shared logic.
+- **`any` in drizzle types**: acceptable at the dialect-abstraction boundary (`SchemaBuilderConfig`, `TableMap`). Drizzle's internal generics are too complex to type precisely without coupling to a specific dialect. Avoid `any` in business logic and public APIs.
+- **Testing source-shipped runtime files** (`runtime/api.ts`, `session-middleware.ts`): `vitest.config.ts` aliases map `clay-cms/access`, `clay-cms/auth`, `astro:middleware` to local sources. `packages/clay-cms/src/test-shims/` holds Astro-virtual stand-ins (currently `astro-middleware.ts` with `defineMiddleware = identity`). Specs use `vi.mock("virtual:clay-cms/...")` per file. `api.spec.ts` runs the cms proxy gate against an in-memory CRUD fake reusing real `matchesWhere`.
+- **No `any` or `!` in spec files** — banned. Use typed helpers (`asRow`/`asRows`, `rowsOf`), guarded destructures, or `as unknown as T` at boundaries. Reference style: `auth/session.spec.ts`.
+- **Adapter conformance suite** (`@clay-cms/adapter-tests`): `runDbConformance({ name, makeAdapter, supportsTransactions })` — a reusable, publishable factory that runs the full DB battery (CRUD, Where ops, select, localization overlay+cascade, `_sessions`/`_rate_limits`, init-SQL idempotency, `requireEmpty`/`requireOther` guards, driver capabilities) against a **live** instance. Runners: `libsql.spec.ts` (`:memory:`) + `better-sqlite3.spec.ts` (also the `db-better-sqlite3` prototype). A new DB adapter must add a runner and pass. `db.run` is awaited (works sync on better-sqlite3, async on libSQL); interactive-tx rollback is proven at the `cms.transaction` layer, not here (in-memory libSQL tx uses a separate connection). D1-via-miniflare + storage conformance are deferred.
+- **Regression-pin tests** point at ROADMAP entries with a comment; failing forces the fix. Today: `crud.spec.ts > "find with where on a localized field in non-default locale"`. (The `where.spec.ts > "like: handles SQL wildcards as literals"` pin is now a *forward* regression pin — the fix landed and the test locks in `[]`/literal-`%`-match behavior so we can't regress back.)
+- CI runs `pnpm test` after build.
+
+## Roadmap
+
+A `ROADMAP.md` file at the repo root tracks planned work (P0/P1/P2, non-goals, open design questions). It's **gitignored** — treat it as a local scratchpad, not a public commitment. When the user asks about future work, priorities, or "what's next," read it first. When architectural decisions land, update both `CLAUDE.md` (for the new state of the world) and `ROADMAP.md` (to check items off or add new ones).
+
+## Current Limitations
+
+- No production migration tooling yet — auto-table-creation (CREATE TABLE IF NOT EXISTS) works for dev but ALTER TABLE / data migrations need a CLI command (like Payload's `payload migrate`).
+- Two db adapters ship: `@clay-cms/db-d1` (Cloudflare) and `@clay-cms/db-libsql` (Turso/local, `file:`/`:memory:` too). Both are SQLite-dialect, so they share `@clay-cms/drizzle` unchanged — the second adapter was a factory + the same 5 column mappings + `@libsql/client` wiring, no `runtime/api.ts` fork (proving the P0 #3 dialect boundary). libSQL additionally supports interactive transactions, so `cms.transaction(fn)` and after-hook rollback work there; on D1 they still throw. Adding `db-postgres` is the same shape with pg column mappings.
+- `actions` re-export still requires the user to add `export { server } from "clay-cms/actions"` to their `src/actions/index.ts` manually. Could be auto-injected.
+- **Field-level _hooks_** are deferred. Field-level _access_ is shipped (`access.read`/`create`/`update` per field, boolean-only). Hooks follow the same collection-first/field-second deferral pattern and will reuse the same field-walk machinery when they land.
+- **Where-clause dot-paths and localized-field filtering** are deferred. Day-one Where supports flat fields only; relationship traversal (`"customer.email"`) waits on the `relationship` field type, and non-default-locale `_translations` joins in `whereToDrizzle` are a known follow-up.

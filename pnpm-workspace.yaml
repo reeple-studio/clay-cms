@@ -1,0 +1,24 @@
+packages:
+  - packages/*
+  - playground
+
+allowBuilds:
+  better-sqlite3: true
+  esbuild: true
+  sharp: false
+  workerd: true
+
+# security overrides — force patched transitive versions (Dependabot)
+# esbuild < 0.28.1: dev-server arbitrary file read on Windows (GHSA, low)
+# kysely  < 0.28.17: JSON-path traversal injection in drizzle-orm's optional peer (high)
+# yaml   < 2.8.3:   stack-overflow via deeply nested YAML (CVE-2026-33532, medium);
+#                   only reaches us via yaml-language-server → @astrojs/check (devDep)
+overrides:
+  esbuild: ">=0.28.1"
+  kysely: ">=0.28.17"
+  yaml: ">=2.8.3"
+
+# supply-chain quarantine on freshly-published versions.
+# temporarily 4h (not the pnpm 11 default of 1440/24h) because this repo tracks
+# bleeding-edge Astro 7 + Cloudflare, which publish same-day. ROADMAP: restore to 1440.
+minimumReleaseAge: 240
