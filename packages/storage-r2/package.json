@@ -33,7 +33,7 @@
 		"clay-cms": "workspace:*"
 	},
 	"devDependencies": {
-		"@cloudflare/workers-types": "^4.20260405.1",
+		"@cloudflare/workers-types": "^4.20260413.1",
 		"tsup": "8.5.1",
 		"typescript": "6.0.2"
 	}
