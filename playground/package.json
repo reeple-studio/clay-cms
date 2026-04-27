@@ -11,18 +11,18 @@
 		"astro": "astro"
 	},
 	"dependencies": {
-		"@astrojs/cloudflare": "^13.1.7",
+		"@astrojs/cloudflare": "^13.2.1",
 		"@clay-cms/db-d1": "workspace:*",
 		"@clay-cms/storage-r2": "workspace:*",
-		"@tailwindcss/vite": "4.2.2",
-		"astro": "6.1.4",
+		"@tailwindcss/vite": "4.2.4",
+		"astro": "6.1.9",
 		"clay-cms": "workspace:*",
 		"drizzle-orm": "^0.45.2",
-		"tailwindcss": "4.2.2"
+		"tailwindcss": "4.2.4"
 	},
 	"devDependencies": {
 		"@astrojs/check": "0.9.8",
-		"@types/node": "25.5.2",
-		"typescript": "6.0.2"
+		"@types/node": "25.6.0",
+		"typescript": "6.0.3"
 	}
 }
