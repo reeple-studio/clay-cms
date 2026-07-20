@@ -71,16 +71,16 @@
 	},
 	"dependencies": {
 		"@clay-cms/drizzle": "workspace:*",
-		"@tailwindcss/vite": "^4.3.2",
+		"@tailwindcss/vite": "^4.3.3",
 		"bcryptjs": "^3.0.3",
 		"drizzle-orm": "^0.45.2",
 		"jiti": "^2.7.0",
-		"tailwindcss": "^4.3.2"
+		"tailwindcss": "^4.3.3"
 	},
 	"devDependencies": {
 		"@types/better-sqlite3": "^7.6.13",
 		"better-sqlite3": "^12.11.1",
 		"tsup": "8.5.1",
-		"typescript": "6.0.3"
+		"typescript": "7.0.2"
 	}
 }
